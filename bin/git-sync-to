@@ -1,0 +1,297 @@
+#!/usr/bin/env bash
+
+set -u
+set -o pipefail
+
+VERSION="0.1.0"
+REMOTE="origin"
+DRY_RUN=0
+TARGET_BRANCH=""
+TEMP_PARENT=""
+TEMP_WORKTREE=""
+CREATED_TEMP_WORKTREE=0
+
+usage() {
+  cat <<'EOF'
+用法：
+  git sync-to <目标分支> [--remote <远端>] [--dry-run]
+
+示例：
+  git sync-to test
+  git sync-to master --remote origin
+  git sync-to test --dry-run
+
+行为：
+  1. 检查当前工作区干净，且当前分支已推送并与远端一致。
+  2. 如果目标分支已有 worktree，则安全复用且不会删除。
+  3. 否则创建临时 worktree，拉取目标分支并合并当前分支。
+  4. 合并冲突时立即中止，不自动解决冲突。
+  5. 合并成功后推送目标分支，并清理脚本创建的临时 worktree。
+
+选项：
+  --remote <名称>  Git 远端名称，默认 origin
+  --dry-run        仅刷新远端并执行安全检查，不合并或推送
+  -h, --help       显示帮助
+  -v, --version    显示版本
+EOF
+}
+
+info() {
+  printf '==> %s\n' "$*"
+}
+
+warn() {
+  printf '警告：%s\n' "$*" >&2
+}
+
+die() {
+  printf '错误：%s\n' "$*" >&2
+  exit 1
+}
+
+cleanup() {
+  cleanup_status=$?
+  trap - EXIT INT TERM
+
+  if [ "$CREATED_TEMP_WORKTREE" -eq 1 ] && [ -n "$TEMP_WORKTREE" ]; then
+    if [ -e "$TEMP_WORKTREE" ]; then
+      if ! git -C "$REPO_ROOT" worktree remove "$TEMP_WORKTREE" >/dev/null 2>&1; then
+        warn "临时 worktree 清理失败，请手动执行：git worktree remove '$TEMP_WORKTREE'"
+      fi
+    fi
+  fi
+
+  if [ -n "$TEMP_PARENT" ] && [ -d "$TEMP_PARENT" ]; then
+    rmdir "$TEMP_PARENT" >/dev/null 2>&1 || true
+  fi
+
+  exit "$cleanup_status"
+}
+
+has_unfinished_operation() {
+  operation_worktree=$1
+  for operation_marker in \
+    MERGE_HEAD \
+    CHERRY_PICK_HEAD \
+    REVERT_HEAD \
+    BISECT_LOG \
+    rebase-merge \
+    rebase-apply
+  do
+    marker_path=$(git -C "$operation_worktree" rev-parse --git-path "$operation_marker" 2>/dev/null) || return 0
+    if [ -e "$marker_path" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+ensure_safe_worktree() {
+  safe_worktree=$1
+  safe_label=$2
+
+  git -C "$safe_worktree" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+    || die "$safe_label 不可访问：$safe_worktree"
+
+  if has_unfinished_operation "$safe_worktree"; then
+    die "$safe_label 存在未完成的 merge/rebase/cherry-pick 等 Git 操作：$safe_worktree"
+  fi
+
+  worktree_changes=$(git -C "$safe_worktree" status --porcelain=v1 --untracked-files=normal) \
+    || die "无法检查 $safe_label 状态：$safe_worktree"
+  if [ -n "$worktree_changes" ]; then
+    printf '%s\n' "$worktree_changes" >&2
+    die "$safe_label 存在未提交修改，请处理后重试：$safe_worktree"
+  fi
+}
+
+find_target_worktree() {
+  wanted_ref="refs/heads/$TARGET_BRANCH"
+  listed_path=""
+  listed_branch=""
+  listed_locked=0
+  TARGET_WORKTREE=""
+  TARGET_WORKTREE_LOCKED=0
+
+  while IFS= read -r worktree_line || [ -n "$worktree_line" ]; do
+    case "$worktree_line" in
+      worktree\ *)
+        listed_path=${worktree_line#worktree }
+        listed_branch=""
+        listed_locked=0
+        ;;
+      branch\ *)
+        listed_branch=${worktree_line#branch }
+        ;;
+      locked|locked\ *)
+        listed_locked=1
+        ;;
+      "")
+        if [ "$listed_branch" = "$wanted_ref" ]; then
+          TARGET_WORKTREE=$listed_path
+          TARGET_WORKTREE_LOCKED=$listed_locked
+          return 0
+        fi
+        listed_path=""
+        listed_branch=""
+        listed_locked=0
+        ;;
+    esac
+  done < <(git -C "$REPO_ROOT" worktree list --porcelain)
+
+  if [ "$listed_branch" = "$wanted_ref" ]; then
+    TARGET_WORKTREE=$listed_path
+    TARGET_WORKTREE_LOCKED=$listed_locked
+  fi
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --remote)
+      [ $# -ge 2 ] || die "--remote 缺少远端名称"
+      REMOTE=$2
+      shift 2
+      ;;
+    --dry-run)
+      DRY_RUN=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    -v|--version)
+      printf 'git-sync-to %s\n' "$VERSION"
+      exit 0
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      die "未知选项：$1"
+      ;;
+    *)
+      if [ -n "$TARGET_BRANCH" ]; then
+        die "只能指定一个目标分支"
+      fi
+      TARGET_BRANCH=$1
+      shift
+      ;;
+  esac
+done
+
+[ $# -eq 0 ] || die "存在无法识别的参数：$*"
+[ -n "$TARGET_BRANCH" ] || {
+  usage >&2
+  exit 1
+}
+
+command -v git >/dev/null 2>&1 || die "未找到 git 命令"
+git check-ref-format --branch "$TARGET_BRANCH" >/dev/null 2>&1 \
+  || die "无效的目标分支名称：$TARGET_BRANCH"
+
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) \
+  || die "当前目录不在 Git 工作区中"
+[ "$(git -C "$REPO_ROOT" rev-parse --is-bare-repository)" = "false" ] \
+  || die "不支持裸仓库"
+
+CURRENT_BRANCH=$(git -C "$REPO_ROOT" symbolic-ref --quiet --short HEAD 2>/dev/null) \
+  || die "当前处于 detached HEAD，无法确定要同步的源分支"
+[ "$CURRENT_BRANCH" != "$TARGET_BRANCH" ] \
+  || die "当前分支与目标分支相同：$CURRENT_BRANCH"
+
+git -C "$REPO_ROOT" remote get-url "$REMOTE" >/dev/null 2>&1 \
+  || die "远端不存在：$REMOTE"
+
+ensure_safe_worktree "$REPO_ROOT" "当前工作区"
+
+info "刷新远端 $REMOTE"
+git -C "$REPO_ROOT" fetch "$REMOTE" \
+  || die "获取远端 $REMOTE 失败"
+
+SOURCE_REMOTE_REF="refs/remotes/$REMOTE/$CURRENT_BRANCH"
+TARGET_REMOTE_REF="refs/remotes/$REMOTE/$TARGET_BRANCH"
+
+git -C "$REPO_ROOT" show-ref --verify --quiet "$SOURCE_REMOTE_REF" \
+  || die "当前分支尚未推送到 $REMOTE：$CURRENT_BRANCH"
+git -C "$REPO_ROOT" show-ref --verify --quiet "$TARGET_REMOTE_REF" \
+  || die "目标远端分支不存在：$REMOTE/$TARGET_BRANCH"
+
+SOURCE_OID=$(git -C "$REPO_ROOT" rev-parse "refs/heads/$CURRENT_BRANCH")
+SOURCE_REMOTE_OID=$(git -C "$REPO_ROOT" rev-parse "$SOURCE_REMOTE_REF")
+if [ "$SOURCE_OID" != "$SOURCE_REMOTE_OID" ]; then
+  SOURCE_AHEAD=$(git -C "$REPO_ROOT" rev-list --count "$SOURCE_REMOTE_REF..refs/heads/$CURRENT_BRANCH")
+  SOURCE_BEHIND=$(git -C "$REPO_ROOT" rev-list --count "refs/heads/$CURRENT_BRANCH..$SOURCE_REMOTE_REF")
+  die "当前分支未与 $REMOTE/$CURRENT_BRANCH 对齐（领先 $SOURCE_AHEAD，落后 $SOURCE_BEHIND），请先完成推送或同步"
+fi
+
+find_target_worktree
+
+if [ -n "$TARGET_WORKTREE" ]; then
+  info "发现目标分支已有 worktree：$TARGET_WORKTREE"
+  if [ "$TARGET_WORKTREE_LOCKED" -eq 1 ]; then
+    info "该 worktree 已锁定；脚本只会复用，不会移动或删除"
+  fi
+  ensure_safe_worktree "$TARGET_WORKTREE" "目标 worktree"
+else
+  info "目标分支没有现有 worktree，将使用临时 worktree"
+fi
+
+if [ "$DRY_RUN" -eq 1 ]; then
+  info "检查完成：将把 $CURRENT_BRANCH 合并到 $TARGET_BRANCH 并推送至 $REMOTE"
+  info "dry-run 模式未执行 pull、merge 或 push"
+  exit 0
+fi
+
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+if [ -z "$TARGET_WORKTREE" ]; then
+  TEMP_PARENT=$(mktemp -d "${TMPDIR:-/tmp}/git-sync-to.XXXXXX") \
+    || die "无法创建临时目录"
+  TEMP_WORKTREE="$TEMP_PARENT/worktree"
+
+  if git -C "$REPO_ROOT" show-ref --verify --quiet "refs/heads/$TARGET_BRANCH"; then
+    git -C "$REPO_ROOT" worktree add "$TEMP_WORKTREE" "$TARGET_BRANCH" \
+      || die "无法为 $TARGET_BRANCH 创建临时 worktree"
+  else
+    git -C "$REPO_ROOT" worktree add --track -b "$TARGET_BRANCH" "$TEMP_WORKTREE" "$REMOTE/$TARGET_BRANCH" \
+      || die "无法基于 $REMOTE/$TARGET_BRANCH 创建本地目标分支"
+  fi
+
+  CREATED_TEMP_WORKTREE=1
+  TARGET_WORKTREE=$TEMP_WORKTREE
+  info "已创建临时 worktree：$TARGET_WORKTREE"
+fi
+
+ensure_safe_worktree "$TARGET_WORKTREE" "目标 worktree"
+
+info "更新目标分支 $REMOTE/$TARGET_BRANCH"
+git -C "$TARGET_WORKTREE" pull --ff-only "$REMOTE" "$TARGET_BRANCH" \
+  || die "目标分支无法快进到 $REMOTE/$TARGET_BRANCH；请检查分支是否已经分叉"
+
+CURRENT_SOURCE_OID=$(git -C "$REPO_ROOT" rev-parse "refs/heads/$CURRENT_BRANCH")
+[ "$CURRENT_SOURCE_OID" = "$SOURCE_OID" ] \
+  || die "执行期间源分支 $CURRENT_BRANCH 发生了变化，请重试"
+
+info "合并 $CURRENT_BRANCH 到 $TARGET_BRANCH"
+if ! git -C "$TARGET_WORKTREE" merge "$CURRENT_BRANCH" --no-edit; then
+  CONFLICT_FILES=$(git -C "$TARGET_WORKTREE" diff --name-only --diff-filter=U)
+  MERGE_HEAD_PATH=$(git -C "$TARGET_WORKTREE" rev-parse --git-path MERGE_HEAD 2>/dev/null || true)
+  if [ -n "$MERGE_HEAD_PATH" ] && [ -e "$MERGE_HEAD_PATH" ]; then
+    git -C "$TARGET_WORKTREE" merge --abort \
+      || warn "自动执行 git merge --abort 失败，请检查：$TARGET_WORKTREE"
+  fi
+  if [ -n "$CONFLICT_FILES" ]; then
+    printf '%s\n' "冲突文件：" "$CONFLICT_FILES" >&2
+  fi
+  die "合并失败，已中止合并；未自动解决冲突，也未推送目标分支"
+fi
+
+info "推送 $TARGET_BRANCH 到 $REMOTE"
+git -C "$TARGET_WORKTREE" push "$REMOTE" "refs/heads/$TARGET_BRANCH:refs/heads/$TARGET_BRANCH" \
+  || die "推送失败；未使用强制推送，请检查远端分支状态后重试"
+
+info "同步完成：$CURRENT_BRANCH -> $REMOTE/$TARGET_BRANCH"
