@@ -22,8 +22,8 @@ usage() {
   git sync-to test --dry-run
 
 行为：
-  1. 检查当前工作区干净，且当前分支已推送并与远端一致。
-  2. 如果目标分支已有 worktree，则安全复用且不会删除。
+  1. 检查当前分支已推送并与远端一致；当前工作区未提交修改仅提示，不参与同步。
+  2. 如果目标分支已有 worktree，则确认其干净后安全复用且不会删除。
   3. 否则创建临时 worktree，拉取目标分支并合并当前分支。
   4. 合并冲突时立即中止，不自动解决冲突。
   5. 合并成功后推送目标分支，并清理脚本创建的临时 worktree。
@@ -79,6 +79,10 @@ has_unfinished_operation() {
     rebase-apply
   do
     marker_path=$(git -C "$operation_worktree" rev-parse --git-path "$operation_marker" 2>/dev/null) || return 0
+    case "$marker_path" in
+      /*) ;;
+      *) marker_path="$operation_worktree/$marker_path" ;;
+    esac
     if [ -e "$marker_path" ]; then
       return 0
     fi
@@ -89,6 +93,7 @@ has_unfinished_operation() {
 ensure_safe_worktree() {
   safe_worktree=$1
   safe_label=$2
+  safe_allow_dirty=${3:-0}
 
   git -C "$safe_worktree" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
     || die "$safe_label 不可访问：$safe_worktree"
@@ -101,7 +106,12 @@ ensure_safe_worktree() {
     || die "无法检查 $safe_label 状态：$safe_worktree"
   if [ -n "$worktree_changes" ]; then
     printf '%s\n' "$worktree_changes" >&2
-    die "$safe_label 存在未提交修改，请处理后重试：$safe_worktree"
+    if [ "$safe_allow_dirty" -eq 1 ]; then
+      warn "$safe_label 存在未提交修改，这些修改不会参与本次同步：$safe_worktree"
+      info "本次仅将分支 $CURRENT_BRANCH 已提交且已推送的内容合并到 $REMOTE/$TARGET_BRANCH"
+    else
+      die "$safe_label 存在未提交修改，请处理后重试：$safe_worktree"
+    fi
   fi
 }
 
@@ -204,7 +214,7 @@ CURRENT_BRANCH=$(git -C "$REPO_ROOT" symbolic-ref --quiet --short HEAD 2>/dev/nu
 git -C "$REPO_ROOT" remote get-url "$REMOTE" >/dev/null 2>&1 \
   || die "远端不存在：$REMOTE"
 
-ensure_safe_worktree "$REPO_ROOT" "当前工作区"
+ensure_safe_worktree "$REPO_ROOT" "当前工作区" 1
 
 info "刷新远端 $REMOTE"
 git -C "$REPO_ROOT" fetch "$REMOTE" \
@@ -214,7 +224,7 @@ SOURCE_REMOTE_REF="refs/remotes/$REMOTE/$CURRENT_BRANCH"
 TARGET_REMOTE_REF="refs/remotes/$REMOTE/$TARGET_BRANCH"
 
 git -C "$REPO_ROOT" show-ref --verify --quiet "$SOURCE_REMOTE_REF" \
-  || die "当前分支尚未推送到 $REMOTE：$CURRENT_BRANCH"
+  || die "当前分支尚未推送到 ${REMOTE}：$CURRENT_BRANCH"
 git -C "$REPO_ROOT" show-ref --verify --quiet "$TARGET_REMOTE_REF" \
   || die "目标远端分支不存在：$REMOTE/$TARGET_BRANCH"
 
@@ -223,7 +233,7 @@ SOURCE_REMOTE_OID=$(git -C "$REPO_ROOT" rev-parse "$SOURCE_REMOTE_REF")
 if [ "$SOURCE_OID" != "$SOURCE_REMOTE_OID" ]; then
   SOURCE_AHEAD=$(git -C "$REPO_ROOT" rev-list --count "$SOURCE_REMOTE_REF..refs/heads/$CURRENT_BRANCH")
   SOURCE_BEHIND=$(git -C "$REPO_ROOT" rev-list --count "refs/heads/$CURRENT_BRANCH..$SOURCE_REMOTE_REF")
-  die "当前分支未与 $REMOTE/$CURRENT_BRANCH 对齐（领先 $SOURCE_AHEAD，落后 $SOURCE_BEHIND），请先完成推送或同步"
+  die "当前分支未与 $REMOTE/$CURRENT_BRANCH 对齐（领先 ${SOURCE_AHEAD}，落后 ${SOURCE_BEHIND}），请先完成推送或同步"
 fi
 
 find_target_worktree
@@ -270,7 +280,7 @@ ensure_safe_worktree "$TARGET_WORKTREE" "目标 worktree"
 
 info "更新目标分支 $REMOTE/$TARGET_BRANCH"
 git -C "$TARGET_WORKTREE" pull --ff-only "$REMOTE" "$TARGET_BRANCH" \
-  || die "目标分支无法快进到 $REMOTE/$TARGET_BRANCH；请检查分支是否已经分叉"
+  || die "目标分支无法快进到 $REMOTE/${TARGET_BRANCH}；请检查分支是否已经分叉"
 
 CURRENT_SOURCE_OID=$(git -C "$REPO_ROOT" rev-parse "refs/heads/$CURRENT_BRANCH")
 [ "$CURRENT_SOURCE_OID" = "$SOURCE_OID" ] \
